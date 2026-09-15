@@ -1,195 +1,146 @@
 """
-Job Postings — helper functions.
+Internship Postings — helper functions.
 
-Everything the scraper and the notebooks need lives here, so the notebooks
-stay short and readable.
+Data comes from the SimplifyJobs / Pitt CSC Summer 2027 internships repo,
+which publishes every listing as a single JSON file and updates it hourly.
 """
 
 import json
-import re
 import urllib.request
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
 
-# Where the daily CSVs get saved. Path() handles Windows backslashes for us.
 DATA_DIR = Path(__file__).parent / "data"
 
-# Words that mark a posting as data-ish. Edit this list — it is the single
-# biggest lever you have on what the whole project ends up measuring.
-ROLE_KEYWORDS = [
-    "data", "analyst", "analytics", "scientist", "machine learning",
-    "ml engineer", "business intelligence", "statistician",
-]
+LISTINGS_URL = (
+    "https://raw.githubusercontent.com/SimplifyJobs/"
+    "Summer2027-Internships/dev/.github/scripts/listings.json"
+)
 
-# Tools/skills to look for in the text of each posting. Left side is what
-# we search for, right side is the clean name we count under. Several
-# spellings can map to one name (google cloud and gcp are the same thing).
-SKILL_PATTERNS = {
-    "python": "Python",
-    "r": "R",
-    "sql": "SQL",
-    "excel": "Excel",
-    "tableau": "Tableau",
-    "power bi": "Power BI",
-    "looker": "Looker",
-    "pandas": "pandas",
-    "spark": "Spark",
-    "aws": "AWS",
-    "azure": "Azure",
-    "gcp": "GCP",
-    "google cloud": "GCP",
-    "snowflake": "Snowflake",
-    "databricks": "Databricks",
-    "airflow": "Airflow",
-    "dbt": "dbt",
-    "docker": "Docker",
-    "git": "Git",
-    "machine learning": "Machine Learning",
-    "deep learning": "Deep Learning",
-    "nlp": "NLP",
-    "statistics": "Statistics",
-}
+# The categories in the raw file. "AI/ML/Data" is the one we care about;
+# change this if you want to compare against Software or Quant.
+CATEGORY = "AI/ML/Data"
+TERM = "Summer 2027"
 
 
-def fetch_jobs():
+def fetch_listings():
     """
-    Pull the current postings from the RemoteOK API and return a DataFrame.
+    Download the full listings file and return it as a DataFrame.
 
-    This makes a real network call, so it returns whatever is live right now.
+    One request gets everything — roughly 17,000 postings, no pagination
+    and no API key. The file is about 12 MB so this takes a few seconds.
     """
     req = urllib.request.Request(
-        "https://remoteok.com/api",
+        LISTINGS_URL,
         headers={"User-Agent": "Mozilla/5.0"},
     )
-    raw = json.loads(urllib.request.urlopen(req, timeout=60).read())
+    raw = json.loads(urllib.request.urlopen(req, timeout=120).read())
 
-    # The first item in the response is a legal notice, not a job, and some
-    # entries have no title. Keep only real postings.
-    jobs = [j for j in raw if isinstance(j, dict) and j.get("position")]
+    df = pd.DataFrame(raw)
 
-    return pd.DataFrame([
-        {
-            "position": j.get("position"),
-            "company": j.get("company"),
-            "location": j.get("location") or "Remote",
-            "tags": ",".join(j.get("tags", [])),
-            "description": strip_html(j.get("description", "")),
-            "url": j.get("url"),
-            "date_posted": j.get("date"),
-        }
-        for j in jobs
-    ])
+    # date_posted and date_updated are Unix timestamps (seconds since 1970).
+    # Convert them to real dates so we can group by month later.
+    for col in ["date_posted", "date_updated"]:
+        df[col] = pd.to_datetime(df[col], unit="s", errors="coerce")
+
+    return df
 
 
-def strip_html(text):
+def filter_roles(df, category=CATEGORY, term=TERM, active_only=True):
     """
-    Remove HTML tags from the description field.
+    Narrow the full file down to the postings we actually want.
 
-    The API returns descriptions as web page markup, so the raw text is full
-    of <p> and <br> junk. This walks the string once and drops anything
-    sitting between a < and a >.
+    Three filters: the job category, the term it is for (a posting can list
+    several), and whether it is still open. Keeping these as arguments means
+    you can swap in "Software" or "Summer 2026" without touching the code.
     """
-    if not text:
-        return ""
-    out = []
-    inside_tag = False
-    for char in text:
-        if char == "<":
-            inside_tag = True
-        elif char == ">":
-            inside_tag = False
-        elif not inside_tag:
-            out.append(char)
-    return " ".join("".join(out).split())
+    keep = df["category"] == category
+
+    # terms is a list per row, so we check for membership rather than equality.
+    keep = keep & df["terms"].apply(
+        lambda t: term in t if isinstance(t, list) else False
+    )
+
+    if active_only:
+        keep = keep & df["active"]
+
+    return df[keep].copy()
 
 
-def is_data_role(df):
+def add_analysis_columns(df):
     """
-    Return a True/False mask for which rows look like data jobs.
+    Add the handful of derived columns the charts need.
 
-    Title only. We deliberately ignore the tags: this site auto-generates
-    them and they are junk — in the sample data a Greenskeeper posting is
-    tagged "analyst, exec, recruiter".
+    Everything here is computed from fields already in the data — no
+    guessing, no outside sources.
     """
-    haystack = df["position"].fillna("").str.lower()
+    out = df.copy()
 
-    mask = pd.Series(False, index=df.index)
-    for word in ROLE_KEYWORDS:
-        mask = mask | haystack.str.contains(word, regex=False)
-    return mask
+    # degrees is a list like ["Bachelor's", "Master's"]. These flags make
+    # "what share accept a bachelor's?" a one-line answer later.
+    out["accepts_bachelors"] = out["degrees"].apply(
+        lambda d: "Bachelor's" in d if isinstance(d, list) else False
+    )
+    out["requires_phd_only"] = out["degrees"].apply(
+        lambda d: d == ["PhD"] if isinstance(d, list) else False
+    )
 
+    # locations is also a list. Count them, and flag remote separately,
+    # since a remote posting is not tied to a city.
+    out["n_locations"] = out["locations"].apply(
+        lambda loc: len(loc) if isinstance(loc, list) else 0
+    )
+    out["is_remote"] = out["locations"].apply(
+        lambda loc: any("remote" in str(x).lower() for x in loc)
+        if isinstance(loc, list) else False
+    )
 
-def extract_skills(row):
-    """
-    Return the list of skills mentioned anywhere in one posting.
+    # Month the posting went up — this is what shows the hiring season.
+    out["posted_month"] = out["date_posted"].dt.to_period("M").astype(str)
 
-    Title and description only — tags are excluded on purpose. 31 of the
-    100 postings in the sample data carry an "excel" tag no matter what the
-    job actually is, which would make Excel look like the top skill in
-    tech. The description is where the real requirements live.
-    """
-    text = " ".join([
-        str(row.get("position", "")),
-        str(row.get("description", "")),
-    ]).lower()
-
-    found = []
-    for pattern, clean_name in SKILL_PATTERNS.items():
-        # \b means "word boundary". Without it, "git" matches the middle of
-        # "digital" and "excel" matches "excellent" — which is exactly the
-        # bug this project hit on the first run.
-        if re.search(rf"\b{re.escape(pattern)}\b", text):
-            if clean_name not in found:
-                found.append(clean_name)
-    return found
+    return out
 
 
 def save_snapshot(df, folder=DATA_DIR):
     """
-    Write today's postings to their own dated file.
+    Write today's filtered postings to their own dated file.
 
-    One file per day is the whole point of the project. Overwriting a single
-    jobs.csv would throw away the history that makes the analysis interesting.
+    Snapshotting daily is what lets you later measure how long postings
+    stay open, since the active flag flips to False when one closes.
     """
     folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"jobs_{date.today().isoformat()}.csv"
-    # utf-8-sig keeps Excel from mangling accented characters if you open it.
-    df.to_csv(path, index=False, encoding="utf-8-sig")
+    path = folder / f"internships_{date.today().isoformat()}.csv"
+
+    # Lists do not survive a round trip through CSV, so flatten them to
+    # semicolon-joined strings on the way out.
+    out = df.copy()
+    for col in ["terms", "locations", "degrees"]:
+        out[col] = out[col].apply(
+            lambda v: "; ".join(map(str, v)) if isinstance(v, list) else ""
+        )
+
+    out.to_csv(path, index=False, encoding="utf-8-sig")
     return path
 
 
 def load_all_snapshots(folder=DATA_DIR):
     """
-    Read every dated CSV in the data folder and stack them into one table.
+    Read every dated CSV back in and stack them into one table.
 
-    Adds a scraped_on column so you can tell which day each row came from,
-    and drops repeats, since the same posting shows up on several days.
+    Adds scraped_on so you can tell which day each row came from.
     """
-    files = sorted(folder.glob("jobs_*.csv"))
+    files = sorted(folder.glob("internships_*.csv"))
     if not files:
         raise FileNotFoundError(
-            f"No jobs_*.csv files in {folder}. Run scrape.py first."
+            f"No internships_*.csv files in {folder}. Run scrape.py first."
         )
 
     frames = []
     for path in files:
-        # utf-8-sig is what fixes the "St Johnâs" garbling.
         part = pd.read_csv(path, encoding="utf-8-sig")
-        part["scraped_on"] = path.stem.replace("jobs_", "")
+        part["scraped_on"] = path.stem.replace("internships_", "")
         frames.append(part)
 
-    everything = pd.concat(frames, ignore_index=True)
-
-    # The same job posted on three days is three rows. Record when we first
-    # and last saw each one, so later you can measure how long postings
-    # stay up, then keep one row per posting.
-    everything["first_seen"] = everything.groupby(
-        ["position", "company"]
-    )["scraped_on"].transform("min")
-    everything["last_seen"] = everything.groupby(
-        ["position", "company"]
-    )["scraped_on"].transform("max")
-
-    return everything.drop_duplicates(subset=["position", "company"])
+    return pd.concat(frames, ignore_index=True)
